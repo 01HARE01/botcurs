@@ -1,6 +1,7 @@
 import telebot
 import requests
 from telebot import types
+from HLTV import *
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import time
@@ -13,11 +14,11 @@ import urllib.parse
 load_dotenv()
 TOKEN = os.getenv("TOKEN")
 PANDA_SCORE = os.getenv("PANDA_SCORE")
+OPEN_DOTA = os.getenv("OPEN_DOTA")
 bot = telebot.TeleBot(TOKEN)
 
 headers = {"Authorization": f"Bearer {PANDA_SCORE}"}
 user_sub = {}
-
 Games = {
     "lol": "League of Legends",
     "csgo": "CS2",              
@@ -25,6 +26,44 @@ Games = {
     "valorant": "Valorant",
     "r6-siege": "Rainbow Six"
 }
+
+
+def format_match(date_ts):
+    return datetime.fromtimestamp(date_ts).strftime("%d.%m.%Y %H:%M")
+
+def get_dota2_team(team_name):
+    try:
+        search = requests.get(f"https://api.opendota.com/api/teams").json()
+        team = next((t for t in search if team_name.lower() in t['name'].lower()), None)
+        if not team:
+            return None
+        team_id = team['team_id']
+        roster_res = requests.get(f"https://api.opendota.com/api/teams/{team_id}/players").json()
+        roster = [(p['name'], '') for p in roster_res if p.get('name')]
+
+        matches_res = requests.get(f"https://api.opendota.com/api/teams/{team_id}/matches?limit=5").json()
+        matches = []
+        wins = 0
+        for m in matches_res[:5]:
+            t1 = team['name']
+            t2 = m.get('opponent_name', 'Неизвестно')
+            date = format_match(m['start_time'])
+            matches.append(f"{t1} vs {t2} — {date}")
+            radiant_win = m['radiant_win']
+            if (m['radiant'] and radiant_win) or (not m['radiant'] and not radiant_win):
+                wins += 1
+        total = len(matches)
+        winrate = round((wins/total)*100,1) if total else 0
+        if winrate > 60:
+            predict = "В отличной форме — хороший шанс победы"
+        elif winrate > 40:
+            predict = "Средняя форма — матч будет равным"
+        else:
+            predict = "Плохая форма — высокий риск поражения"
+
+        return {"roster": roster, "matches": matches, "stats": {"wins": wins, "losses": total-wins, "winrate": winrate}, "predict": predict}
+    except:
+        return None
 
 def md_escape(text: str) -> str:
     if not text:
@@ -124,6 +163,7 @@ def start(message):
         "Привет! Я бот для отслеживания киберспортивных матчей.\n\n"
         "Вот что я умею:\n"
         "/matches — посмотреть ближайшие матчи по выбранной игре\n"
+        "/team — посмотреть cтатистику команды\n"
         "/alerts — подписаться на уведомления о начале матчей\n"
         "/unsubscribe — отписаться от уведомлений\n\n"
         "Я поддерживаю игры: League of Legends, CS2, Dota 2, Valorant, Rainbow Six.\n"
@@ -224,6 +264,51 @@ def show_match_info(call):
     bot.send_message(call.message.chat.id, text)
 
 _sent_notifications = set()
+@bot.message_handler(commands=['team'])
+def cmd_team(message):
+    msg = bot.send_message(message.chat.id, "Введите название команды Dota2:")
+    bot.register_next_step_handler(msg, team_name_received)
+
+def team_name_received(message):
+    user_id = message.from_user.id
+    team = message.text.strip()
+    data = get_dota2_team(team)
+    if not data:
+        bot.send_message(user_id, "Данные команды не найдены")
+        return
+
+    kb = types.InlineKeyboardMarkup(row_width=2)
+    kb.add(types.InlineKeyboardButton("Состав", callback_data="action_roster"))
+    kb.add(types.InlineKeyboardButton("Последние матчи", callback_data="action_matches"))
+    kb.add(types.InlineKeyboardButton("Статистика", callback_data="action_stats"))
+    kb.add(types.InlineKeyboardButton("Прогноз", callback_data="action_predict"))
+    bot.send_message(user_id, f"Команда установлена: {team}\nВыберите действие:", reply_markup=kb)
+
+user_team_data = {}
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("action_"))
+def action_handler(call):
+    user_id = call.from_user.id
+    action = call.data.split("_")[1]
+
+    team_name = call.message.text.split("\n")[0].replace("Команда установлена: ", "")
+    data = get_dota2_team(team_name)
+    if not data:
+        bot.send_message(user_id, "Данные команды не найдены")
+        return
+
+    text = ""
+    if action == "roster":
+        text = "Состав:\n" + "\n".join([f"{p[0]} — {p[1]}" for p in data['roster']])
+    elif action == "matches":
+        text = "Последние 5 матчей:\n" + "\n".join(data['matches'])
+    elif action == "stats":
+        s = data['stats']
+        text = f"Статистика:\nПобеды: {s['wins']}\nПоражения: {s['losses']}\nWinrate: {s['winrate']}%"
+    elif action == "predict":
+        text = f"Прогноз:\n{data['predict']}"
+
+    bot.send_message(user_id, md_escape(text), parse_mode="MarkdownV2")
 def check_matches():
     while True:
         try:
